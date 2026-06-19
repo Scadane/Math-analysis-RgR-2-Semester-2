@@ -199,13 +199,15 @@ def get_biome_colors(Z, is_smooth=True):
         
         return colors
 
-def get_shaded_terrain_colors(Z, light_dir=(1.0, 1.0, 1.0), is_smooth=True, ambient=0.15):
+def get_shaded_terrain_colors(Z, light_dir=(1.0, 1.0, 1.0), is_smooth=True, ambient=0.15, dx=1.0, dy=1.0):
     """
     Выполняет полный расчет затенения и биомов, возвращая финальную раскраску.
-    
+
+    :param dx: Шаг сетки по оси X (важен для корректного уклона нормалей)
+    :param dy: Шаг сетки по оси Y
     :return: 3D массив RGB цветов (H, W, 3)
     """
-    normals = calculate_normals(Z)
+    normals = calculate_normals(Z, dx=dx, dy=dy)
     intensity = calculate_lighting(normals, light_dir, ambient)
     base_colors = get_biome_colors(Z, is_smooth)
     
