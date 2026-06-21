@@ -123,7 +123,12 @@ st.sidebar.caption(roughness_desc)
 
 z_scale = st.sidebar.slider("Масштаб высоты Z:", min_value=5.0, max_value=80.0, value=30.0, step=2.5)
 
-smooth_biomes = st.sidebar.checkbox("Плавные биомы (интерполяция)", value=True)
+smooth_biomes = st.sidebar.checkbox(
+    "Плавные биомы (градиентные переходы)",
+    value=True,
+    help="Включено: цвета плавно интерполируются между биомами (вода→песок→лес→скалы→снег). "
+         "Выключено: резкие цветовые зоны по жёстким порогам высоты — каждый пиксель строго в одном биоме."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🗺️ Размер мира")
@@ -248,23 +253,30 @@ intensity = calculate_lighting(normals, light_dir)
 base_colors = get_biome_colors(Z_big, is_smooth=smooth_biomes)
 colors_big = np.clip(base_colors * intensity[..., np.newaxis], 0.0, 1.0)
 
-# Переводим в rgb строки для Plotly
+# ── Подготовка геометрии и цветов для Mesh3d ──────────────────────
+# go.Surface рендерит цвет только через colorscale (ненадёжно для точных
+# RGB, даёт прозрачность/потерю цветов). go.Mesh3d + vertexcolor даёт
+# точный цвет на каждую вершину.
 c_int = (colors_big * 255).astype(int)
-rgb_big = np.char.add(
-    np.char.add(
-        np.char.add(
-            np.char.add("rgb(", c_int[..., 0].astype(str)),
-            ","
-        ),
-        np.char.add(c_int[..., 1].astype(str), ",")
-    ),
-    np.char.add(c_int[..., 2].astype(str), ")")
-)
+rows, cols = Z_big.shape
 
-# ── Нарезка на чанки с общей границей (шаг grid_size-1) ──────────
-def slice_chunk(arr, n, i, j):
-    """Вырезает чанк (i, j) размера n×n. Соседние чанки делят границу."""
-    return arr[i * (n - 1): i * (n - 1) + n, j * (n - 1): j * (n - 1) + n]
+# vertexcolor: одна rgb-строка на вершину (row-major)
+vertex_colors = [f"rgb({c_int[r,c,0]},{c_int[r,c,1]},{c_int[r,c,2]})"
+                 for r in range(rows) for c in range(cols)]
+
+# Векторизованная триангуляция: каждый квадрат (r,c)→(r+1,c+1) → 2 треугольника
+rr, cc = np.meshgrid(np.arange(rows - 1), np.arange(cols - 1), indexing='ij')
+# Треугольник 1: (r,c), (r+1,c), (r,c+1)
+i1 = (rr * cols + cc).ravel()
+j1 = ((rr + 1) * cols + cc).ravel()
+k1 = (rr * cols + (cc + 1)).ravel()
+# Треугольник 2: (r+1,c+1), (r+1,c), (r,c+1) — перевёрнутый
+i2 = ((rr + 1) * cols + (cc + 1)).ravel()
+j2 = ((rr + 1) * cols + cc).ravel()
+k2 = (rr * cols + (cc + 1)).ravel()
+tri_I = np.concatenate([i1, i2]).tolist()
+tri_J = np.concatenate([j1, j2]).tolist()
+tri_K = np.concatenate([k1, k2]).tolist()
 
 # Вкладки на основном экране
 tab_3d, tab_spectra, tab_math = st.tabs(["🖥️ Интерактивный 3D-рендер", "📊 Частотная фильтрация", "📖 Математическая справка"])
@@ -275,36 +287,28 @@ with tab_3d:
     st.markdown(f"**Текущий режим:** {mode}. "
                 f"Сгенерировано {chunks_count} чанк(ов/а) при радиусе R={radius}. "
                 f"Высота вершин отмасштабирована в {z_scale} раз. "
+                f"Биомы: {'плавные градиенты' if smooth_biomes else 'дискретные зоны'}. "
                 "Вращайте, приближайте и исследуйте ландшафт мышью. "
                 "Меняйте ползунки солнца — тени перемещаются по склонам.", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Сборка 3D-сцены: отдельные Surface для каждого чанка + линии границ
-    traces = []
-    for i in range(n_side):
-        for j in range(n_side):
-            Zc = slice_chunk(Z_big, grid_size, i, j)
-            Xc = slice_chunk(X_big, grid_size, i, j)
-            Yc = slice_chunk(Y_big, grid_size, i, j)
-            Cc = slice_chunk(rgb_big, grid_size, i, j)
-            traces.append(go.Surface(
-                x=Xc, y=Yc, z=Zc * z_scale,
-                surfacecolor=Cc,
-                showscale=False,
-                hoverinfo='none',
-                contours=dict(
-                    z=dict(show=False),
-                    x=dict(show=False),
-                    y=dict(show=False),
-                )
-            ))
+    # 3D-рендер: Mesh3d с vertexcolor (точный RGB) + линии границ чанков
+    traces = [go.Mesh3d(
+        x=X_big.ravel(), y=Y_big.ravel(), z=(Z_big * z_scale).ravel(),
+        i=tri_I, j=tri_J, k=tri_K,
+        vertexcolor=vertex_colors,
+        flatshading=True,
+        hoverinfo='skip',
+        showlegend=False,
+    )]
 
     # Линии границ чанков: сетка (n_side+1)×(n_side+1), слегка приподнята
     if radius > 1:
         border_lift = 0.5
         border_line = dict(color="rgba(15,15,15,0.55)", width=2)
+        chunk_step = grid_size - 1  # шаг нарезки в индексах массива
         for k in range(n_side + 1):
-            idx = min(k * (grid_size - 1), big - 1)
+            idx = min(k * chunk_step, big - 1)
             # Вертикальная линия (фиксированный X-индекс, вдоль Y)
             traces.append(go.Scatter3d(
                 x=X_big[idx, :], y=Y_big[idx, :], z=Z_big[idx, :] * z_scale + border_lift,
